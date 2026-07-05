@@ -10,6 +10,8 @@ Hybrid-casual chain-reaction game: place your star shells on a fuse network, lig
 
 In: deterministic sim engine, seeded board generator, Monte Carlo EV auditor (logging only), 3-shell placement, all node types except Finale Cluster, crawling-spark juice, run summary, seed input (share a seed to fake a daily tournament).
 
+**Toolbox thin slice** (design exploration beyond GDD v1.0, pending a v1.1 amendment): each run grants a rig budget (6⚡) spendable on player-placed tools — Jumper Fuses (2⚡, string your own fuse between nearby points) and Booster Kegs (2⚡, convert a junction to a booster). Tools are deterministic sim inputs: the replay payload is `(seed, shells[], tools[])`, validated by `src/sim/tools.ts` with the same rules client- and (future) server-side.
+
 Out (deliberately): surge windows, shell traits, compendium, economy, tournaments backend, monetization, real art.
 
 ## Quick start

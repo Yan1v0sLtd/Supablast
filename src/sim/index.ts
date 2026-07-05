@@ -9,3 +9,12 @@ export * from './prng';
 export { generateBoard } from './generator';
 export { simulate, drawOutcomes, canonicalOutcomes } from './engine';
 export { auditBoard, type BoardAudit, type SocketAudit } from './audit';
+export {
+  applyTools,
+  boardDistance,
+  toolCost,
+  toolsCost,
+  validateTools,
+  type ToolPlacement,
+  type ToolValidation,
+} from './tools';

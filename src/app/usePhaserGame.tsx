@@ -30,6 +30,7 @@ export function usePhaserGame(bridge: SceneBridge) {
       // Proxy so the scene always talks to the latest bridge callbacks.
       scene.setBridge({
         onSocketToggled: (id, placed) => bridgeRef.current.onSocketToggled(id, placed),
+        onToolsChanged: (info) => bridgeRef.current.onToolsChanged(info),
         onHud: (u) => bridgeRef.current.onHud(u),
         onRunFinished: () => bridgeRef.current.onRunFinished(),
       });

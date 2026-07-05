@@ -81,6 +81,14 @@ export const TUNING = {
     shellBaseValue: 10,
     maxTicks: 3600, // 3min hard stop; a healthy ride is 15–25s
   },
+  /** Rig Toolbox (thin slice): player-built additions to the fuse network. */
+  tools: {
+    budget: 6, // rig points per run
+    jumperCost: 2,
+    jumperMaxDistance: 2.3, // board-grid units
+    jumperBurnTicks: 10, // 0.5s — player fuses burn at a steady rate
+    kegCost: 2,
+  },
   audit: {
     iterations: 500,
     evDeviationLimit: 0.2, // ±20% from board mean

@@ -79,3 +79,30 @@ export const RING_INFO: Record<SocketRing, RingInfo> = {
 };
 
 export const SHELL_EMOJI = '🌟';
+
+export interface ToolInfo {
+  emoji: string;
+  name: string;
+  blurb: string;
+  color: number;
+  cssColor: string;
+}
+
+/** The Rig Toolbox (thin slice): player-built additions to the network. */
+export const TOOL_INFO = {
+  jumper: {
+    emoji: '🧵',
+    name: 'Jumper Fuse',
+    blurb: 'String your own fuse between two nearby points. Open a route the rig doesn’t have.',
+    color: 0x2dd4bf,
+    cssColor: '#2dd4bf',
+  },
+  keg: {
+    emoji: '🧨',
+    name: 'Booster Keg',
+    blurb: 'Plant on any plain junction: ×1.5 multiplier and the flame doubles speed.',
+    color: 0xf97316,
+    cssColor: '#f97316',
+  },
+} satisfies Record<string, ToolInfo>;
+

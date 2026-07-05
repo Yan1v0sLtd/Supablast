@@ -241,6 +241,58 @@ button.primary {
   letter-spacing: 1px;
 }
 
+.toolbar {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: rgba(16, 22, 42, 0.94);
+  border: 1px solid #273049;
+  border-radius: 999px;
+  padding: 6px 10px;
+  z-index: 4;
+  white-space: nowrap;
+}
+
+.toolbar .tool {
+  padding: 7px 11px;
+  font-size: 13px;
+  border-radius: 999px;
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+}
+
+.toolbar .tool small {
+  color: #9ca3af;
+  font-size: 10px;
+}
+
+.toolbar .tool.active {
+  background: #f97316;
+  border-color: #f97316;
+  color: #0b0e1a;
+}
+
+.toolbar .tool.active small {
+  color: #431407;
+}
+
+.budget {
+  font-size: 13px;
+  font-weight: 700;
+  color: #fbbf24;
+  padding: 0 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.budget.spent {
+  color: #6b7280;
+}
+
 .panel.legend {
   max-height: 82%;
   overflow-y: auto;

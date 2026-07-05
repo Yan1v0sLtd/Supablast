@@ -6,12 +6,15 @@
  * frames, fireworks — bends presentation time only; sim ticks are LAW.
  */
 import Phaser from 'phaser';
-import { TICK_MS } from '../sim';
-import type { Board, BoardEdge, BoardNode, RunResult, SimEvent } from '../sim';
-import { NODE_INFO, RING_INFO, SHELL_EMOJI } from './nodeInfo';
+import { TICK_MS, TUNING, boardDistance, toolsCost } from '../sim';
+import type { Board, BoardEdge, BoardNode, RunResult, SimEvent, ToolPlacement } from '../sim';
+import { NODE_INFO, RING_INFO, SHELL_EMOJI, TOOL_INFO } from './nodeInfo';
+
+export type ToolMode = 'shell' | 'jumper' | 'keg';
 
 export interface SceneBridge {
   onSocketToggled(socketId: number, placed: boolean): void;
+  onToolsChanged(info: { cost: number; jumpers: number; kegs: number }): void;
   onHud(update: { multiplier?: number; score?: number; scoreDelta?: number }): void;
   onRunFinished(): void;
 }
@@ -66,6 +69,13 @@ export class FuseScene extends Phaser.Scene {
   private placedSockets = new Set<number>();
   private maxShells = 3;
   private tooltip?: Phaser.GameObjects.Container;
+
+  // Rig Toolbox state (thin slice: jumper fuses + booster kegs)
+  private toolMode: ToolMode = 'shell';
+  private placedKegs = new Map<number, Phaser.GameObjects.Text>();
+  private placedJumpers: Array<{ a: number; b: number; g: Phaser.GameObjects.Graphics }> = [];
+  private jumperFirst?: number;
+  private rangeHintG?: Phaser.GameObjects.Graphics;
 
   // playback state
   private playing = false;
@@ -233,34 +243,49 @@ export class FuseScene extends Phaser.Scene {
       const rg = this.add.graphics().setDepth(5);
       this.drawSocketRing(rg, p.x, p.y, ring.color, false);
       this.socketRings.set(node.id, rg);
-      const hit = this.add.circle(p.x, p.y, 22, 0xffffff, 0.001).setDepth(6);
-      hit.setInteractive({ useHandCursor: true });
-      hit.on('pointerdown', () => this.handleSocketClick(node.id));
       const label = this.add
         .text(p.x, p.y + 22, ring.odds, { fontSize: '9px', color: ring.cssColor, fontStyle: 'bold' })
         .setOrigin(0.5)
         .setDepth(5);
       this.nodeIcons.set(node.id, label);
-      return;
+    } else {
+      const glowRadius = node.kind === 'junction' ? 4 : node.kind === 'ignition' ? 14 : 11;
+      const glow = this.add
+        .circle(p.x, p.y, glowRadius, info.color, node.kind === 'junction' ? 0.7 : 0.22)
+        .setDepth(5);
+      this.nodeGlows.set(node.id, glow);
+      if (info.emoji) {
+        const icon = this.add
+          .text(p.x, p.y, info.emoji, { fontSize: node.kind === 'ignition' ? '22px' : '16px' })
+          .setOrigin(0.5)
+          .setDepth(6);
+        this.nodeIcons.set(node.id, icon);
+        if (node.kind === 'ignition' && !this.reducedMotion) {
+          this.tweens.add({ targets: icon, scale: 1.18, duration: 700, yoyo: true, repeat: -1 });
+        }
+      }
     }
 
-    const glowRadius = node.kind === 'junction' ? 4 : node.kind === 'ignition' ? 14 : 11;
-    const glow = this.add.circle(p.x, p.y, glowRadius, info.color, node.kind === 'junction' ? 0.7 : 0.22).setDepth(5);
-    this.nodeGlows.set(node.id, glow);
+    // Every node is tappable; what a tap means depends on the active tool.
+    const hit = this.add.circle(p.x, p.y, node.kind === 'socket' ? 22 : 16, 0xffffff, 0.001).setDepth(6);
+    hit.setInteractive({ useHandCursor: true });
+    hit.on('pointerdown', () => this.handleNodeTap(node.id));
+  }
 
-    if (info.emoji) {
-      const icon = this.add
-        .text(p.x, p.y, info.emoji, { fontSize: node.kind === 'ignition' ? '22px' : '16px' })
-        .setOrigin(0.5)
-        .setDepth(6);
-      this.nodeIcons.set(node.id, icon);
-      if (node.kind === 'ignition' && !this.reducedMotion) {
-        this.tweens.add({ targets: icon, scale: 1.18, duration: 700, yoyo: true, repeat: -1 });
-      }
-      // Special nodes explain themselves on tap during placement.
-      const hit = this.add.circle(p.x, p.y, 18, 0xffffff, 0.001).setDepth(6);
-      hit.setInteractive({ useHandCursor: true });
-      hit.on('pointerdown', () => this.showTooltip(node));
+  private handleNodeTap(nodeId: number) {
+    if (!this.placementEnabled) return;
+    const node = this.nodeById.get(nodeId)!;
+    switch (this.toolMode) {
+      case 'shell':
+        if (node.kind === 'socket') this.handleSocketClick(nodeId);
+        else if (NODE_INFO[node.kind].emoji) this.showTooltip(node);
+        break;
+      case 'keg':
+        this.handleKegTap(node);
+        break;
+      case 'jumper':
+        this.handleJumperTap(node);
+        break;
     }
   }
 
@@ -316,6 +341,146 @@ export class FuseScene extends Phaser.Scene {
     this.bridge.onSocketToggled(socketId, true);
   }
 
+  // ------------------------------------------------------------- toolbox
+
+  setToolMode(mode: ToolMode) {
+    this.toolMode = mode;
+    this.jumperFirst = undefined;
+    this.rangeHintG?.destroy();
+    this.rangeHintG = undefined;
+    this.tooltip?.destroy();
+    this.tooltip = undefined;
+  }
+
+  getTools(): ToolPlacement[] {
+    const jumpers: ToolPlacement[] = this.placedJumpers
+      .map((j) => ({ type: 'jumper' as const, a: Math.min(j.a, j.b), b: Math.max(j.a, j.b) }))
+      .sort((x, y) => x.a - y.a || x.b - y.b);
+    const kegs: ToolPlacement[] = [...this.placedKegs.keys()]
+      .sort((a, b) => a - b)
+      .map((nodeId) => ({ type: 'keg' as const, nodeId }));
+    return [...jumpers, ...kegs];
+  }
+
+  private remainingBudget(): number {
+    return TUNING.tools.budget - toolsCost(this.getTools());
+  }
+
+  private notifyTools() {
+    this.bridge.onToolsChanged({
+      cost: toolsCost(this.getTools()),
+      jumpers: this.placedJumpers.length,
+      kegs: this.placedKegs.size,
+    });
+  }
+
+  private handleKegTap(node: BoardNode) {
+    const p = this.toScreen(node);
+    const existing = this.placedKegs.get(node.id);
+    if (existing) {
+      existing.destroy();
+      this.placedKegs.delete(node.id);
+      this.notifyTools();
+      return;
+    }
+    if (node.kind !== 'junction') {
+      this.showTooltip(node);
+      return;
+    }
+    if (this.remainingBudget() < TUNING.tools.kegCost) {
+      this.floatText(p.x, p.y - 14, 'No rig points left!', '#f87171', 12);
+      return;
+    }
+    const keg = this.add.text(p.x, p.y, TOOL_INFO.keg.emoji, { fontSize: '16px' }).setOrigin(0.5).setDepth(7);
+    this.placedKegs.set(node.id, keg);
+    this.tweens.add({ targets: keg, scale: { from: 0, to: 1 }, duration: 200, ease: 'Back.Out' });
+    this.sparkleAt(p.x, p.y, TOOL_INFO.keg.color, 8);
+    this.notifyTools();
+  }
+
+  private handleJumperTap(node: BoardNode) {
+    const p = this.toScreen(node);
+    // Tapping an endpoint of an existing jumper removes it.
+    const hitIndex = this.placedJumpers.findIndex((j) => j.a === node.id || j.b === node.id);
+    if (this.jumperFirst === undefined && hitIndex >= 0) {
+      this.placedJumpers[hitIndex].g.destroy();
+      this.placedJumpers.splice(hitIndex, 1);
+      this.notifyTools();
+      return;
+    }
+    if (this.jumperFirst === undefined) {
+      if (this.remainingBudget() < TUNING.tools.jumperCost) {
+        this.floatText(p.x, p.y - 14, 'No rig points left!', '#f87171', 12);
+        return;
+      }
+      this.jumperFirst = node.id;
+      this.drawJumperRangeHints(node);
+      return;
+    }
+    if (this.jumperFirst === node.id) {
+      this.jumperFirst = undefined;
+      this.rangeHintG?.destroy();
+      this.rangeHintG = undefined;
+      return;
+    }
+    const a = this.jumperFirst;
+    const b = node.id;
+    this.jumperFirst = undefined;
+    this.rangeHintG?.destroy();
+    this.rangeHintG = undefined;
+    if (!this.isLegalJumper(a, b)) {
+      this.floatText(p.x, p.y - 14, 'Too far / already strung', '#f87171', 12);
+      return;
+    }
+    const g = this.add.graphics().setDepth(3);
+    this.drawRope(g, a, b, TOOL_INFO.jumper.color, 0.95);
+    this.placedJumpers.push({ a, b, g });
+    this.sparkleAt(p.x, p.y, TOOL_INFO.jumper.color, 8);
+    this.notifyTools();
+  }
+
+  private isLegalJumper(a: number, b: number): boolean {
+    if (!this.board) return false;
+    const key = `${Math.min(a, b)}-${Math.max(a, b)}`;
+    const taken =
+      this.board.edges.some((e) => `${Math.min(e.a, e.b)}-${Math.max(e.a, e.b)}` === key) ||
+      this.placedJumpers.some((j) => `${Math.min(j.a, j.b)}-${Math.max(j.a, j.b)}` === key);
+    return !taken && boardDistance(this.board, a, b) <= TUNING.tools.jumperMaxDistance;
+  }
+
+  /** While choosing a jumper's far end: show reach + highlight legal partners. */
+  private drawJumperRangeHints(from: BoardNode) {
+    this.rangeHintG?.destroy();
+    const g = this.add.graphics().setDepth(7);
+    this.rangeHintG = g;
+    const p = this.toScreen(from);
+    const pxPerUnit = (this.scale.width - 90) / Math.max(0.001, this.bounds.maxX - this.bounds.minX);
+    g.lineStyle(1.5, TOOL_INFO.jumper.color, 0.45);
+    g.strokeCircle(p.x, p.y, TUNING.tools.jumperMaxDistance * pxPerUnit);
+    g.fillStyle(TOOL_INFO.jumper.color, 0.9);
+    for (const other of this.board!.nodes) {
+      if (other.id !== from.id && this.isLegalJumper(from.id, other.id)) {
+        const q = this.toScreen(other);
+        g.fillCircle(q.x, q.y, 3.5);
+      }
+    }
+  }
+
+  /** Sagging rope between two nodes — same silhouette as generated fuses. */
+  private drawRope(g: Phaser.GameObjects.Graphics, a: number, b: number, color: number, alpha: number) {
+    const pa = this.toScreen(this.nodeById.get(a)!);
+    const pb = this.toScreen(this.nodeById.get(b)!);
+    const len = Phaser.Math.Distance.Between(pa.x, pa.y, pb.x, pb.y);
+    const mid = new Phaser.Math.Vector2((pa.x + pb.x) / 2, (pa.y + pb.y) / 2 + len * 0.12 + 5);
+    const curve = new Phaser.Curves.QuadraticBezier(
+      new Phaser.Math.Vector2(pa.x, pa.y),
+      mid,
+      new Phaser.Math.Vector2(pb.x, pb.y),
+    );
+    g.lineStyle(2, color, alpha);
+    curve.draw(g, 20);
+  }
+
   private showTooltip(node: BoardNode) {
     if (!this.placementEnabled) return;
     this.tooltip?.destroy();
@@ -367,10 +532,38 @@ export class FuseScene extends Phaser.Scene {
     this.speed = speed;
   }
 
-  playRun(result: RunResult) {
+  /**
+   * Start playback. `riggedBoard` is the board the sim actually burned —
+   * base board + applied tools — so jumper edges and keg conversions get
+   * curves, FX and correct node identities during the ride.
+   */
+  playRun(result: RunResult, riggedBoard?: Board) {
     this.placementEnabled = false;
     this.tooltip?.destroy();
     this.tooltip = undefined;
+    this.jumperFirst = undefined;
+    this.rangeHintG?.destroy();
+    this.rangeHintG = undefined;
+    if (riggedBoard) {
+      this.board = riggedBoard;
+      this.nodeById = new Map(riggedBoard.nodes.map((n) => [n.id, n]));
+      this.edgeById = new Map(riggedBoard.edges.map((e) => [e.id, e]));
+      for (const edge of riggedBoard.edges) {
+        if (this.edgeCurves.has(edge.id)) continue;
+        const a = this.toScreen(this.nodeById.get(edge.a)!);
+        const b = this.toScreen(this.nodeById.get(edge.b)!);
+        const len = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
+        const mid = new Phaser.Math.Vector2((a.x + b.x) / 2, (a.y + b.y) / 2 + len * 0.12 + 5);
+        this.edgeCurves.set(
+          edge.id,
+          new Phaser.Curves.QuadraticBezier(
+            new Phaser.Math.Vector2(a.x, a.y),
+            mid,
+            new Phaser.Math.Vector2(b.x, b.y),
+          ),
+        );
+      }
+    }
     this.playing = true;
     this.finished = false;
     this.runEvents = result.events;
@@ -812,6 +1005,11 @@ export class FuseScene extends Phaser.Scene {
     this.socketRings.clear();
     this.shellStars.clear();
     this.edgeCurves.clear();
+    this.placedKegs.clear();
+    this.placedJumpers = [];
+    this.jumperFirst = undefined;
+    this.rangeHintG = undefined;
+    this.toolMode = 'shell';
     this.dimRect = undefined;
     this.tooltip = undefined;
     this.freezeCallout = undefined;
