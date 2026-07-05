@@ -103,6 +103,7 @@ export class FuseScene extends Phaser.Scene {
   private dragStartY = 0;
   private dragStartScroll = 0;
   private manualScrollUntil = 0;
+  private slowmoActive = false;
 
   /**
    * UI scale factor: the canvas buffer is created at 540*devicePixelRatio,
@@ -143,7 +144,7 @@ export class FuseScene extends Phaser.Scene {
       if (!p.isDown || this.worldH === 0) return;
       if (Math.abs(p.y - this.dragStartY) > 10 * this.k) this.dragging = true;
       if (this.dragging) {
-        this.setScroll(this.dragStartScroll - (p.y - this.dragStartY));
+        this.setScroll(this.dragStartScroll - (p.y - this.dragStartY) / this.cameras.main.zoom);
         this.manualScrollUntil = this.time.now + 2000;
       }
     });
@@ -688,16 +689,23 @@ export class FuseScene extends Phaser.Scene {
 
   /** Presentation-time dilation: freeze-frames and damp-approach slow-mo. */
   private currentDilation(nowReal: number): number {
+    this.slowmoActive = false;
     if (this.reducedMotion) return 1;
     let d = 1;
-    if (nowReal < this.freezeUntil) d = Math.min(d, 0.1);
+    if (nowReal < this.freezeUntil) {
+      d = Math.min(d, 0.1);
+      this.slowmoActive = true;
+    }
     // Only the last stretch before a damp gate slows time — long enough to
     // sweat, short enough that a 12-damp board doesn't drag the whole ride.
     for (const burn of this.activeBurns) {
       const target = this.nodeById.get(burn.targetNodeId);
       if (target?.kind === 'damp') {
         const progress = (this.elapsedMs / TICK_MS - burn.startTick) / burn.durationTicks;
-        if (progress > 0.75) d = Math.min(d, 0.35);
+        if (progress > 0.75) {
+          d = Math.min(d, 0.35);
+          this.slowmoActive = true;
+        }
       }
     }
     return d;
@@ -747,26 +755,7 @@ export class FuseScene extends Phaser.Scene {
       }
     }
 
-    // Camera rides with the flame front (manual swipes win for 2s).
-    if (nowReal > this.manualScrollUntil && !this.reducedMotion) {
-      let targetY: number | undefined;
-      if (this.activeBurns.length > 0) {
-        let sum = 0;
-        for (const burn of this.activeBurns) sum += burn.spark.y;
-        targetY = sum / this.activeBurns.length;
-      } else if (this.pendingJumps.length > 0) {
-        const gap = this.nodeById.get(this.pendingJumps[0].fromNodeId);
-        if (gap) targetY = this.toScreen(gap).y;
-      }
-      if (targetY !== undefined) {
-        const desired = Phaser.Math.Clamp(
-          targetY - this.scale.height * 0.55,
-          0,
-          Math.max(0, this.worldH - this.scale.height),
-        );
-        this.cameras.main.scrollY += (desired - this.cameras.main.scrollY) * 0.06;
-      }
-    }
+    this.updateCameraRig(nowReal);
 
     // Fake-finale staging: nothing burning, but a jump is pending → dim the
     // world and let the spark gap pulse alone in the dark.
@@ -780,6 +769,46 @@ export class FuseScene extends Phaser.Scene {
       this.setDim(false);
       this.bridge.onRunFinished();
     }
+  }
+
+  /**
+   * Cinematic camera: after IGNITE the camera punches in and rides up the
+   * rig with the flame front; damp-gate slow-mo and freeze-frames punch in
+   * harder. Manual swipes win for 2s; reduced-motion gets a static camera.
+   */
+  private updateCameraRig(nowReal: number) {
+    const cam = this.cameras.main;
+    if (this.reducedMotion) return;
+
+    // Zoom: 1.0 idle → 1.12 riding → 1.35 during slow-mo drama.
+    const targetZoom = this.playing && !this.finished ? (this.slowmoActive ? 1.35 : 1.12) : 1;
+    cam.setZoom(cam.zoom + (targetZoom - cam.zoom) * 0.07);
+
+    if (nowReal <= this.manualScrollUntil) return;
+    let target: { x: number; y: number } | undefined;
+    if (this.activeBurns.length > 0) {
+      let sx = 0;
+      let sy = 0;
+      for (const burn of this.activeBurns) {
+        sx += burn.spark.x;
+        sy += burn.spark.y;
+      }
+      target = { x: sx / this.activeBurns.length, y: sy / this.activeBurns.length };
+    } else if (this.pendingJumps.length > 0) {
+      const gap = this.nodeById.get(this.pendingJumps[0].fromNodeId);
+      if (gap) target = this.toScreen(gap);
+    }
+    if (!target) return;
+
+    // The flame sits slightly below screen center so the unburned rig ahead
+    // stays visible — the camera climbs "with the lines".
+    const viewW = this.scale.width / cam.zoom;
+    const viewH = this.scale.height / cam.zoom;
+    const desiredY = Phaser.Math.Clamp(target.y - viewH * 0.55, 0, Math.max(0, this.worldH - viewH));
+    const desiredX = Phaser.Math.Clamp(target.x - viewW / 2, 0, Math.max(0, this.scale.width - viewW));
+    const rate = this.slowmoActive ? 0.12 : 0.05;
+    cam.scrollY += (desiredY - cam.scrollY) * rate;
+    cam.scrollX += (desiredX - cam.scrollX) * rate;
   }
 
   private setDim(on: boolean) {
@@ -963,10 +992,9 @@ export class FuseScene extends Phaser.Scene {
     this.freezeCallout = this.buildCallout(p.x, p.y - 40 * this.k, `${info.emoji} ${info.name.toUpperCase()}`, info.blurb);
     const icon = this.nodeIcons.get(node.id);
     if (icon) this.tweens.add({ targets: icon, scale: { from: 2.1, to: 1 }, duration: 1300, ease: 'Cubic.Out' });
-    this.cameras.main.zoomTo(1.05, 250, 'Sine.easeOut', true);
+    // Zoom is handled by the camera rig: freeze counts as slow-mo drama.
     const callout = this.freezeCallout;
     this.time.delayedCall(1500, () => {
-      this.cameras.main.zoomTo(1, 300, 'Sine.easeOut', true);
       callout?.destroy();
       if (this.freezeCallout === callout) this.freezeCallout = undefined;
     });
@@ -1124,6 +1152,8 @@ export class FuseScene extends Phaser.Scene {
     this.tweens.killAll();
     this.time.removeAllEvents();
     this.cameras.main.setZoom(1);
+    this.cameras.main.scrollX = 0;
+    this.slowmoActive = false;
     this.children.removeAll(true);
     this.nodeGlows.clear();
     this.nodeIcons.clear();
