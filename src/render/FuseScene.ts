@@ -97,6 +97,22 @@ export class FuseScene extends Phaser.Scene {
   private seenKinds = new Set<string>();
   private reducedMotion = false;
 
+  // scrollable world + camera
+  private worldH = 0;
+  private dragging = false;
+  private dragStartY = 0;
+  private dragStartScroll = 0;
+  private manualScrollUntil = 0;
+
+  /**
+   * UI scale factor: the canvas buffer is created at 540*devicePixelRatio,
+   * so every logical pixel value is multiplied by k. This is what keeps
+   * text/emoji/strokes sharp on 2x/3x screens.
+   */
+  private get k(): number {
+    return this.scale.width / 540;
+  }
+
   constructor() {
     super(FuseScene.KEY);
   }
@@ -110,25 +126,55 @@ export class FuseScene extends Phaser.Scene {
     } catch {
       this.seenKinds = new Set();
     }
-    // 8x8 soft dot texture for every particle in the game.
+    // Soft dot texture for every particle in the game (scaled for DPR).
+    const dot = Math.max(4, Math.round(4 * this.k));
     const g = this.make.graphics({ x: 0, y: 0 }, false);
-    g.fillStyle(0xffffff, 1).fillCircle(4, 4, 3);
-    g.generateTexture('dot', 8, 8);
+    g.fillStyle(0xffffff, 1).fillCircle(dot, dot, dot * 0.75);
+    g.generateTexture('dot', dot * 2, dot * 2);
     g.destroy();
+
+    // The rig is taller than the screen: swipe to scout it, wheel on desktop.
+    this.input.on('pointerdown', (p: Phaser.Input.Pointer) => {
+      this.dragging = false;
+      this.dragStartY = p.y;
+      this.dragStartScroll = this.cameras.main.scrollY;
+    });
+    this.input.on('pointermove', (p: Phaser.Input.Pointer) => {
+      if (!p.isDown || this.worldH === 0) return;
+      if (Math.abs(p.y - this.dragStartY) > 10 * this.k) this.dragging = true;
+      if (this.dragging) {
+        this.setScroll(this.dragStartScroll - (p.y - this.dragStartY));
+        this.manualScrollUntil = this.time.now + 2000;
+      }
+    });
+    this.input.on(
+      'wheel',
+      (_p: Phaser.Input.Pointer, _objs: unknown, _dx: number, dy: number) => {
+        if (this.worldH === 0) return;
+        this.setScroll(this.cameras.main.scrollY + dy * 0.7);
+        this.manualScrollUntil = this.time.now + 2000;
+      },
+    );
+  }
+
+  private setScroll(y: number) {
+    this.cameras.main.scrollY = Phaser.Math.Clamp(y, 0, Math.max(0, this.worldH - this.scale.height));
   }
 
   setBridge(bridge: SceneBridge) {
     this.bridge = bridge;
   }
 
+  /** Board grid → world coordinates. The world is ~1.7 screens tall. */
   private toScreen(node: { x: number; y: number }): { x: number; y: number } {
     const { minX, maxX, minY, maxY } = this.bounds;
     const W = this.scale.width;
-    const H = this.scale.height;
-    const pad = 45;
+    const H = this.worldH || this.scale.height;
+    const pad = 45 * this.k;
+    const padBottom = 115 * this.k; // keep the ignition row clear of the toolbar overlay
     return {
       x: pad + ((node.x - minX) / Math.max(0.001, maxX - minX)) * (W - pad * 2),
-      y: pad + ((node.y - minY) / Math.max(0.001, maxY - minY)) * (H - pad * 2),
+      y: pad + ((node.y - minY) / Math.max(0.001, maxY - minY)) * (H - pad - padBottom),
     };
   }
 
@@ -147,6 +193,10 @@ export class FuseScene extends Phaser.Scene {
       minY: Math.min(...ys),
       maxY: Math.max(...ys),
     };
+    this.worldH = Math.round(1500 * this.k);
+    this.cameras.main.setBounds(0, 0, this.scale.width, this.worldH);
+    // Start at the bottom: ignition and the safe sockets; swipe up to scout.
+    this.setScroll(this.worldH);
 
     this.paintSky();
 
@@ -154,12 +204,12 @@ export class FuseScene extends Phaser.Scene {
     this.fuseBaseG = this.add.graphics().setDepth(2);
     this.burnedG = this.add.graphics().setDepth(3);
     this.activeG = this.add.graphics().setDepth(4);
-    this.fuseBaseG.lineStyle(2, ROPE_COLOR, 0.85);
+    this.fuseBaseG.lineStyle(2 * this.k, ROPE_COLOR, 0.85);
     for (const edge of board.edges) {
       const a = this.toScreen(this.nodeById.get(edge.a)!);
       const b = this.toScreen(this.nodeById.get(edge.b)!);
       const len = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
-      const mid = new Phaser.Math.Vector2((a.x + b.x) / 2, (a.y + b.y) / 2 + len * 0.12 + 5);
+      const mid = new Phaser.Math.Vector2((a.x + b.x) / 2, (a.y + b.y) / 2 + len * 0.12 + 5 * this.k);
       const curve = new Phaser.Curves.QuadraticBezier(
         new Phaser.Math.Vector2(a.x, a.y),
         mid,
@@ -170,7 +220,9 @@ export class FuseScene extends Phaser.Scene {
     }
 
     // Spark-gap jump hints: faint dotted arcs.
-    const hintG = this.add.graphics({ lineStyle: { width: 1, color: 0xd946ef, alpha: 0.28 } }).setDepth(2);
+    const hintG = this.add
+      .graphics({ lineStyle: { width: 1 * this.k, color: 0xd946ef, alpha: 0.28 } })
+      .setDepth(2);
     for (const node of board.nodes) {
       if (node.kind === 'sparkGap' && node.sparkTargetId !== undefined) {
         const from = this.toScreen(node);
@@ -180,7 +232,7 @@ export class FuseScene extends Phaser.Scene {
           const t1 = (i + 1) / 16;
           const arc = (t: number) => ({
             x: from.x + (to.x - from.x) * t,
-            y: from.y + (to.y - from.y) * t - Math.sin(t * Math.PI) * 26,
+            y: from.y + (to.y - from.y) * t - Math.sin(t * Math.PI) * 26 * this.k,
           });
           const p0 = arc(t0);
           const p1 = arc(t1);
@@ -194,14 +246,15 @@ export class FuseScene extends Phaser.Scene {
 
   private paintSky() {
     const W = this.scale.width;
-    const H = this.scale.height;
+    const H = this.worldH;
+    const k = this.k;
     const sky = this.add.graphics().setDepth(0);
     sky.fillGradientStyle(SKY_TOP, SKY_TOP, SKY_BOTTOM, SKY_BOTTOM, 1);
     sky.fillRect(0, 0, W, H);
     // Stars (render-only randomness — the sim never sees this).
-    for (let i = 0; i < 34; i++) {
+    for (let i = 0; i < 60; i++) {
       const star = this.add
-        .circle(Math.random() * W, Math.random() * H * 0.8, Math.random() * 1.2 + 0.4, 0xdde5ff, 0.7)
+        .circle(Math.random() * W, Math.random() * H * 0.85, (Math.random() * 1.2 + 0.4) * k, 0xdde5ff, 0.7)
         .setDepth(0);
       if (!this.reducedMotion) {
         this.tweens.add({
@@ -222,10 +275,10 @@ export class FuseScene extends Phaser.Scene {
     let x = 0;
     let step = 0;
     while (x < W) {
-      const w = 40 + Math.random() * 70;
-      const h = 12 + Math.random() * 26;
-      roof.lineTo(x, H - h - (step % 2) * 8);
-      roof.lineTo(Math.min(W, x + w), H - h - (step % 2) * 8);
+      const w = (40 + Math.random() * 70) * k;
+      const h = (12 + Math.random() * 26) * k;
+      roof.lineTo(x, H - h - (step % 2) * 8 * k);
+      roof.lineTo(Math.min(W, x + w), H - h - (step % 2) * 8 * k);
       x += w;
       step++;
     }
@@ -237,6 +290,7 @@ export class FuseScene extends Phaser.Scene {
   private buildNode(node: BoardNode) {
     const info = NODE_INFO[node.kind];
     const p = this.toScreen(node);
+    const k = this.k;
 
     if (node.kind === 'socket') {
       const ring = RING_INFO[node.ring ?? 'mid'];
@@ -244,19 +298,19 @@ export class FuseScene extends Phaser.Scene {
       this.drawSocketRing(rg, p.x, p.y, ring.color, false);
       this.socketRings.set(node.id, rg);
       const label = this.add
-        .text(p.x, p.y + 22, ring.odds, { fontSize: '9px', color: ring.cssColor, fontStyle: 'bold' })
+        .text(p.x, p.y + 22 * k, ring.odds, { fontSize: `${9 * k}px`, color: ring.cssColor, fontStyle: 'bold' })
         .setOrigin(0.5)
         .setDepth(5);
       this.nodeIcons.set(node.id, label);
     } else {
-      const glowRadius = node.kind === 'junction' ? 4 : node.kind === 'ignition' ? 14 : 11;
+      const glowRadius = (node.kind === 'junction' ? 4 : node.kind === 'ignition' ? 14 : 11) * k;
       const glow = this.add
         .circle(p.x, p.y, glowRadius, info.color, node.kind === 'junction' ? 0.7 : 0.22)
         .setDepth(5);
       this.nodeGlows.set(node.id, glow);
       if (info.emoji) {
         const icon = this.add
-          .text(p.x, p.y, info.emoji, { fontSize: node.kind === 'ignition' ? '22px' : '16px' })
+          .text(p.x, p.y, info.emoji, { fontSize: `${(node.kind === 'ignition' ? 22 : 16) * k}px` })
           .setOrigin(0.5)
           .setDepth(6);
         this.nodeIcons.set(node.id, icon);
@@ -267,9 +321,14 @@ export class FuseScene extends Phaser.Scene {
     }
 
     // Every node is tappable; what a tap means depends on the active tool.
-    const hit = this.add.circle(p.x, p.y, node.kind === 'socket' ? 22 : 16, 0xffffff, 0.001).setDepth(6);
+    // Taps resolve on pointerUP so swipe-scrolling never triggers them.
+    const hit = this.add
+      .circle(p.x, p.y, (node.kind === 'socket' ? 22 : 16) * k, 0xffffff, 0.001)
+      .setDepth(6);
     hit.setInteractive({ useHandCursor: true });
-    hit.on('pointerdown', () => this.handleNodeTap(node.id));
+    hit.on('pointerup', () => {
+      if (!this.dragging) this.handleNodeTap(node.id);
+    });
   }
 
   private handleNodeTap(nodeId: number) {
@@ -290,9 +349,10 @@ export class FuseScene extends Phaser.Scene {
   }
 
   private drawSocketRing(g: Phaser.GameObjects.Graphics, x: number, y: number, color: number, filled: boolean) {
+    const k = this.k;
     g.clear();
-    g.lineStyle(2, color, 0.95);
-    const r = 13;
+    g.lineStyle(2 * k, color, 0.95);
+    const r = 13 * k;
     for (let i = 0; i < 12; i += 2) {
       g.beginPath();
       g.arc(x, y, r, (i / 12) * Math.PI * 2, ((i + 1.3) / 12) * Math.PI * 2);
@@ -300,7 +360,7 @@ export class FuseScene extends Phaser.Scene {
     }
     if (filled) {
       g.fillStyle(color, 0.14);
-      g.fillCircle(x, y, r - 2);
+      g.fillCircle(x, y, r - 2 * k);
     }
   }
 
@@ -333,7 +393,10 @@ export class FuseScene extends Phaser.Scene {
       return;
     }
     this.placedSockets.add(socketId);
-    const star = this.add.text(p.x, p.y, SHELL_EMOJI, { fontSize: '18px' }).setOrigin(0.5).setDepth(7);
+    const star = this.add
+      .text(p.x, p.y, SHELL_EMOJI, { fontSize: `${18 * this.k}px` })
+      .setOrigin(0.5)
+      .setDepth(7);
     this.shellStars.set(socketId, star);
     this.drawSocketRing(this.socketRings.get(socketId)!, p.x, p.y, ring.color, true);
     this.tweens.add({ targets: star, scale: { from: 0, to: 1 }, duration: 220, ease: 'Back.Out' });
@@ -388,10 +451,13 @@ export class FuseScene extends Phaser.Scene {
       return;
     }
     if (this.remainingBudget() < TUNING.tools.kegCost) {
-      this.floatText(p.x, p.y - 14, 'No rig points left!', '#f87171', 12);
+      this.floatText(p.x, p.y - 14 * this.k, 'No rig points left!', '#f87171', 12);
       return;
     }
-    const keg = this.add.text(p.x, p.y, TOOL_INFO.keg.emoji, { fontSize: '16px' }).setOrigin(0.5).setDepth(7);
+    const keg = this.add
+      .text(p.x, p.y, TOOL_INFO.keg.emoji, { fontSize: `${16 * this.k}px` })
+      .setOrigin(0.5)
+      .setDepth(7);
     this.placedKegs.set(node.id, keg);
     this.tweens.add({ targets: keg, scale: { from: 0, to: 1 }, duration: 200, ease: 'Back.Out' });
     this.sparkleAt(p.x, p.y, TOOL_INFO.keg.color, 8);
@@ -410,7 +476,7 @@ export class FuseScene extends Phaser.Scene {
     }
     if (this.jumperFirst === undefined) {
       if (this.remainingBudget() < TUNING.tools.jumperCost) {
-        this.floatText(p.x, p.y - 14, 'No rig points left!', '#f87171', 12);
+        this.floatText(p.x, p.y - 14 * this.k, 'No rig points left!', '#f87171', 12);
         return;
       }
       this.jumperFirst = node.id;
@@ -429,7 +495,7 @@ export class FuseScene extends Phaser.Scene {
     this.rangeHintG?.destroy();
     this.rangeHintG = undefined;
     if (!this.isLegalJumper(a, b)) {
-      this.floatText(p.x, p.y - 14, 'Too far / already strung', '#f87171', 12);
+      this.floatText(p.x, p.y - 14 * this.k, 'Too far / already strung', '#f87171', 12);
       return;
     }
     const g = this.add.graphics().setDepth(3);
@@ -454,14 +520,14 @@ export class FuseScene extends Phaser.Scene {
     const g = this.add.graphics().setDepth(7);
     this.rangeHintG = g;
     const p = this.toScreen(from);
-    const pxPerUnit = (this.scale.width - 90) / Math.max(0.001, this.bounds.maxX - this.bounds.minX);
-    g.lineStyle(1.5, TOOL_INFO.jumper.color, 0.45);
+    const pxPerUnit = (this.scale.width - 90 * this.k) / Math.max(0.001, this.bounds.maxX - this.bounds.minX);
+    g.lineStyle(1.5 * this.k, TOOL_INFO.jumper.color, 0.45);
     g.strokeCircle(p.x, p.y, TUNING.tools.jumperMaxDistance * pxPerUnit);
     g.fillStyle(TOOL_INFO.jumper.color, 0.9);
     for (const other of this.board!.nodes) {
       if (other.id !== from.id && this.isLegalJumper(from.id, other.id)) {
         const q = this.toScreen(other);
-        g.fillCircle(q.x, q.y, 3.5);
+        g.fillCircle(q.x, q.y, 3.5 * this.k);
       }
     }
   }
@@ -471,13 +537,13 @@ export class FuseScene extends Phaser.Scene {
     const pa = this.toScreen(this.nodeById.get(a)!);
     const pb = this.toScreen(this.nodeById.get(b)!);
     const len = Phaser.Math.Distance.Between(pa.x, pa.y, pb.x, pb.y);
-    const mid = new Phaser.Math.Vector2((pa.x + pb.x) / 2, (pa.y + pb.y) / 2 + len * 0.12 + 5);
+    const mid = new Phaser.Math.Vector2((pa.x + pb.x) / 2, (pa.y + pb.y) / 2 + len * 0.12 + 5 * this.k);
     const curve = new Phaser.Curves.QuadraticBezier(
       new Phaser.Math.Vector2(pa.x, pa.y),
       mid,
       new Phaser.Math.Vector2(pb.x, pb.y),
     );
-    g.lineStyle(2, color, alpha);
+    g.lineStyle(2 * this.k, color, alpha);
     curve.draw(g, 20);
   }
 
@@ -492,7 +558,7 @@ export class FuseScene extends Phaser.Scene {
         : `${info.emoji} ${info.name}`;
     const blurb =
       node.kind === 'socket' && node.ring ? `${RING_INFO[node.ring].odds} payout\n${info.blurb}` : info.blurb;
-    this.tooltip = this.buildCallout(p.x, p.y - 34, title, blurb);
+    this.tooltip = this.buildCallout(p.x, p.y - 34 * this.k, title, blurb);
     const tip = this.tooltip;
     this.time.delayedCall(2600, () => {
       if (this.tooltip === tip) {
@@ -503,24 +569,27 @@ export class FuseScene extends Phaser.Scene {
   }
 
   private buildCallout(x: number, y: number, title: string, blurb: string): Phaser.GameObjects.Container {
-    const titleText = this.add.text(0, 0, title, { fontSize: '13px', color: '#ffe9a8', fontStyle: 'bold' });
-    const blurbText = this.add.text(0, 18, blurb, {
-      fontSize: '11px',
+    const k = this.k;
+    const titleText = this.add.text(0, 0, title, { fontSize: `${13 * k}px`, color: '#ffe9a8', fontStyle: 'bold' });
+    const blurbText = this.add.text(0, 18 * k, blurb, {
+      fontSize: `${11 * k}px`,
       color: '#d7dcea',
-      wordWrap: { width: 190 },
-      lineSpacing: 3,
+      wordWrap: { width: 190 * k },
+      lineSpacing: 3 * k,
     });
-    const w = Math.max(titleText.width, blurbText.width) + 20;
-    const h = blurbText.y + blurbText.height + 12;
+    const w = Math.max(titleText.width, blurbText.width) + 20 * k;
+    const h = blurbText.y + blurbText.height + 12 * k;
     const bg = this.add.graphics();
     bg.fillStyle(0x10162a, 0.96);
-    bg.lineStyle(1, 0x3d4a73, 1);
-    bg.fillRoundedRect(-10, -8, w, h, 7);
-    bg.strokeRoundedRect(-10, -8, w, h, 7);
+    bg.lineStyle(1 * k, 0x3d4a73, 1);
+    bg.fillRoundedRect(-10 * k, -8 * k, w, h, 7 * k);
+    bg.strokeRoundedRect(-10 * k, -8 * k, w, h, 7 * k);
     const container = this.add.container(0, 0, [bg, titleText, blurbText]).setDepth(30);
-    const cx = Phaser.Math.Clamp(x - w / 2, 8, this.scale.width - w - 8);
-    const cy = Phaser.Math.Clamp(y - h, 8, this.scale.height - h - 8);
-    container.setPosition(cx + 10, cy + 8);
+    // Clamp within the camera's current view, not the (taller) world.
+    const view = this.cameras.main.worldView;
+    const cx = Phaser.Math.Clamp(x - w / 2, view.x + 8 * k, view.right - w - 8 * k);
+    const cy = Phaser.Math.Clamp(y - h, view.y + 8 * k, view.bottom - h - 8 * k);
+    container.setPosition(cx + 10 * k, cy + 8 * k);
     container.setAlpha(0);
     this.tweens.add({ targets: container, alpha: 1, duration: 140 });
     return container;
@@ -553,7 +622,7 @@ export class FuseScene extends Phaser.Scene {
         const a = this.toScreen(this.nodeById.get(edge.a)!);
         const b = this.toScreen(this.nodeById.get(edge.b)!);
         const len = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
-        const mid = new Phaser.Math.Vector2((a.x + b.x) / 2, (a.y + b.y) / 2 + len * 0.12 + 5);
+        const mid = new Phaser.Math.Vector2((a.x + b.x) / 2, (a.y + b.y) / 2 + len * 0.12 + 5 * this.k);
         this.edgeCurves.set(
           edge.id,
           new Phaser.Curves.QuadraticBezier(
@@ -577,12 +646,13 @@ export class FuseScene extends Phaser.Scene {
   }
 
   private ensureEmitters() {
+    const k = this.k;
     this.ember?.destroy();
     this.boom?.destroy();
     this.smoke?.destroy();
     this.ember = this.add
       .particles(0, 0, 'dot', {
-        speed: { min: 6, max: 30 },
+        speed: { min: 6 * k, max: 30 * k },
         angle: { min: 60, max: 120 },
         scale: { start: 0.7, end: 0 },
         lifespan: { min: 260, max: 520 },
@@ -594,10 +664,10 @@ export class FuseScene extends Phaser.Scene {
       .setDepth(8);
     this.boom = this.add
       .particles(0, 0, 'dot', {
-        speed: { min: 60, max: 260 },
+        speed: { min: 60 * k, max: 260 * k },
         scale: { start: 1.1, end: 0 },
         lifespan: { min: 450, max: 950 },
-        gravityY: 130,
+        gravityY: 130 * k,
         tint: [0xfbbf24, 0xf97316, 0xef4444, 0xd946ef, 0xa5f3fc],
         emitting: false,
         blendMode: Phaser.BlendModes.ADD,
@@ -605,7 +675,7 @@ export class FuseScene extends Phaser.Scene {
       .setDepth(12);
     this.smoke = this.add
       .particles(0, 0, 'dot', {
-        speed: { min: 4, max: 18 },
+        speed: { min: 4 * k, max: 18 * k },
         angle: { min: 250, max: 290 },
         scale: { start: 1.3, end: 2.2 },
         alpha: { start: 0.35, end: 0 },
@@ -621,11 +691,13 @@ export class FuseScene extends Phaser.Scene {
     if (this.reducedMotion) return 1;
     let d = 1;
     if (nowReal < this.freezeUntil) d = Math.min(d, 0.1);
+    // Only the last stretch before a damp gate slows time — long enough to
+    // sweat, short enough that a 12-damp board doesn't drag the whole ride.
     for (const burn of this.activeBurns) {
       const target = this.nodeById.get(burn.targetNodeId);
       if (target?.kind === 'damp') {
         const progress = (this.elapsedMs / TICK_MS - burn.startTick) / burn.durationTicks;
-        if (progress > 0.55) d = Math.min(d, 0.32);
+        if (progress > 0.75) d = Math.min(d, 0.35);
       }
     }
     return d;
@@ -658,7 +730,7 @@ export class FuseScene extends Phaser.Scene {
       if (Math.random() < 0.55) this.ember.emitParticleAt(pos.x, pos.y);
 
       // Ember trail: burned portion of the rope.
-      this.activeG.lineStyle(2.5, EMBER_COLOR, 0.95);
+      this.activeG.lineStyle(2.5 * this.k, EMBER_COLOR, 0.95);
       const from = reversed ? t : 0;
       const to = reversed ? 1 : t;
       const pts = curve.getPoints(20).filter((_, idx) => idx / 20 >= from && idx / 20 <= to);
@@ -667,11 +739,32 @@ export class FuseScene extends Phaser.Scene {
       }
 
       if (progress >= 1) {
-        this.burnedG.lineStyle(2.5, EMBER_COLOR, 0.8);
+        this.burnedG.lineStyle(2.5 * this.k, EMBER_COLOR, 0.8);
         curve.draw(this.burnedG, 20);
         burn.spark.destroy();
         burn.glow.destroy();
         this.activeBurns.splice(i, 1);
+      }
+    }
+
+    // Camera rides with the flame front (manual swipes win for 2s).
+    if (nowReal > this.manualScrollUntil && !this.reducedMotion) {
+      let targetY: number | undefined;
+      if (this.activeBurns.length > 0) {
+        let sum = 0;
+        for (const burn of this.activeBurns) sum += burn.spark.y;
+        targetY = sum / this.activeBurns.length;
+      } else if (this.pendingJumps.length > 0) {
+        const gap = this.nodeById.get(this.pendingJumps[0].fromNodeId);
+        if (gap) targetY = this.toScreen(gap).y;
+      }
+      if (targetY !== undefined) {
+        const desired = Phaser.Math.Clamp(
+          targetY - this.scale.height * 0.55,
+          0,
+          Math.max(0, this.worldH - this.scale.height),
+        );
+        this.cameras.main.scrollY += (desired - this.cameras.main.scrollY) * 0.06;
       }
     }
 
@@ -692,8 +785,10 @@ export class FuseScene extends Phaser.Scene {
   private setDim(on: boolean) {
     this.dimmed = on;
     if (!this.dimRect) {
+      // Screen-space overlay: covers the viewport wherever the camera is.
       this.dimRect = this.add
         .rectangle(this.scale.width / 2, this.scale.height / 2, this.scale.width, this.scale.height, 0x02030a, 0)
+        .setScrollFactor(0)
         .setDepth(9);
     }
     this.tweens.add({ targets: this.dimRect, fillAlpha: on ? 0.5 : 0, duration: on ? 600 : 250 });
@@ -722,8 +817,8 @@ export class FuseScene extends Phaser.Scene {
         const edge = this.edgeById.get(e.edgeId)!;
         const target = edge.a === e.fromNodeId ? edge.b : edge.a;
         const tint = SPARK_TINTS[this.tintCycle++ % SPARK_TINTS.length];
-        const spark = this.add.circle(0, 0, 3.5, tint).setDepth(10);
-        const glow = this.add.circle(0, 0, 9, EMBER_COLOR, 0.35).setDepth(9);
+        const spark = this.add.circle(0, 0, 3.5 * this.k, tint).setDepth(10);
+        const glow = this.add.circle(0, 0, 9 * this.k, EMBER_COLOR, 0.35).setDepth(9);
         this.activeBurns.push({
           edge,
           fromNodeId: e.fromNodeId,
@@ -752,22 +847,22 @@ export class FuseScene extends Phaser.Scene {
             const dies = next?.type === 'FIZZLE' && next.nodeId === e.nodeId;
             if (!dies) {
               this.flashAt(p.x, p.y, 0xffffff, 34);
-              this.floatText(p.x, p.y - 16, 'SURVIVED! +2', '#7dd3fc', 15);
+              this.floatText(p.x, p.y - 16 * this.k, 'SURVIVED! +2', '#7dd3fc', 15);
               this.shake(140, 0.006);
             }
             break;
           }
           case 'booster':
-            this.floatText(p.x, p.y - 16, '×1.5 FASTER!', '#fdba74', 15);
+            this.floatText(p.x, p.y - 16 * this.k, '×1.5 FASTER!', '#fdba74', 15);
             this.boom.emitParticleAt(p.x, p.y, 14);
             this.shake(160, 0.007);
             break;
           case 'splitter':
-            this.floatText(p.x, p.y - 16, 'SPLIT! +2', '#fde047', 14);
+            this.floatText(p.x, p.y - 16 * this.k, 'SPLIT! +2', '#fde047', 14);
             this.sparkleAt(p.x, p.y, 0xeab308, 12);
             break;
           case 'sparkGap':
-            this.floatText(p.x, p.y - 16, '+3', '#f0abfc', 13);
+            this.floatText(p.x, p.y - 16 * this.k, '+3', '#f0abfc', 13);
             break;
           default:
             break;
@@ -785,7 +880,7 @@ export class FuseScene extends Phaser.Scene {
       case 'FIZZLE': {
         const p = this.toScreen(this.nodeById.get(e.nodeId)!);
         this.smoke.emitParticleAt(p.x, p.y, 9);
-        this.floatText(p.x, p.y - 14, 'fzzz…', '#94a3b8', 14);
+        this.floatText(p.x, p.y - 14 * this.k, 'fzzz…', '#94a3b8', 14);
         const icon = this.nodeIcons.get(e.nodeId);
         if (icon) this.tweens.add({ targets: icon, alpha: 0.35, duration: 500 });
         break;
@@ -794,7 +889,7 @@ export class FuseScene extends Phaser.Scene {
         this.pendingJumps.push({ fromNodeId: e.fromNodeId, targetNodeId: e.targetNodeId, arriveTick: e.arriveTick });
         const from = this.toScreen(this.nodeById.get(e.fromNodeId)!);
         const to = this.toScreen(this.nodeById.get(e.targetNodeId)!);
-        const comet = this.add.circle(from.x, from.y, 4.5, 0xf0abfc).setDepth(14);
+        const comet = this.add.circle(from.x, from.y, 4.5 * this.k, 0xf0abfc).setDepth(14);
         comet.setVisible(false);
         const flightMs = 420 / this.speed;
         const waitMs = Math.max(0, ((e.arriveTick - e.tick) * TICK_MS) / this.speed - flightMs);
@@ -802,7 +897,7 @@ export class FuseScene extends Phaser.Scene {
           comet.setVisible(true);
           const curve = new Phaser.Curves.QuadraticBezier(
             new Phaser.Math.Vector2(from.x, from.y),
-            new Phaser.Math.Vector2((from.x + to.x) / 2, Math.min(from.y, to.y) - 60),
+            new Phaser.Math.Vector2((from.x + to.x) / 2, Math.min(from.y, to.y) - 60 * this.k),
             new Phaser.Math.Vector2(to.x, to.y),
           );
           const holder = { t: 0 };
@@ -835,7 +930,7 @@ export class FuseScene extends Phaser.Scene {
       }
       case 'DECOY_PAID': {
         const p = this.toScreen(this.nodeById.get(e.nodeId)!);
-        this.floatText(p.x, p.y - 12, `+${e.value}`, '#4ade80', 13);
+        this.floatText(p.x, p.y - 12 * this.k, `+${e.value}`, '#4ade80', 13);
         this.sparkleAt(p.x, p.y, 0x22c55e, 7);
         this.bridge.onHud({ scoreDelta: e.value });
         break;
@@ -865,7 +960,7 @@ export class FuseScene extends Phaser.Scene {
     const info = NODE_INFO[node.kind];
     this.freezeUntil = this.time.now + 1400;
     this.freezeCallout?.destroy();
-    this.freezeCallout = this.buildCallout(p.x, p.y - 40, `${info.emoji} ${info.name.toUpperCase()}`, info.blurb);
+    this.freezeCallout = this.buildCallout(p.x, p.y - 40 * this.k, `${info.emoji} ${info.name.toUpperCase()}`, info.blurb);
     const icon = this.nodeIcons.get(node.id);
     if (icon) this.tweens.add({ targets: icon, scale: { from: 2.1, to: 1 }, duration: 1300, ease: 'Cubic.Out' });
     this.cameras.main.zoomTo(1.05, 250, 'Sine.easeOut', true);
@@ -879,8 +974,10 @@ export class FuseScene extends Phaser.Scene {
 
   /** Shell payout = an actual firework: rocket up, burst, payout in lights. */
   private launchFirework(x: number, y: number, payout: number, multiplier: number) {
-    const apexY = Math.max(70, y - 120 - Math.min(140, payout / 4));
-    const rocket = this.add.circle(x, y, 3, 0xfff3b0).setDepth(14);
+    const k = this.k;
+    const viewTop = this.cameras.main.worldView.y;
+    const apexY = Math.max(viewTop + 70 * k, y - (120 + Math.min(140, payout / 4)) * k);
+    const rocket = this.add.circle(x, y, 3 * k, 0xfff3b0).setDepth(14);
     this.tweens.add({
       targets: rocket,
       y: apexY,
@@ -891,21 +988,24 @@ export class FuseScene extends Phaser.Scene {
         rocket.destroy();
         const count = Math.min(70, 22 + Math.floor(payout / 8));
         this.boom.emitParticleAt(x, apexY, count);
-        const ringFx = this.add.circle(x, apexY, 6, 0xffffff, 0).setStrokeStyle(2, 0xffe9a8, 1).setDepth(13);
+        const ringFx = this.add
+          .circle(x, apexY, 6 * k, 0xffffff, 0)
+          .setStrokeStyle(2 * k, 0xffe9a8, 1)
+          .setDepth(13);
         this.tweens.add({
           targets: ringFx,
-          radius: 44 + Math.min(50, payout / 8),
+          radius: (44 + Math.min(50, payout / 8)) * k,
           alpha: 0,
           duration: 620,
           onComplete: () => ringFx.destroy(),
         });
         const size = payout >= 300 ? 26 : payout >= 100 ? 21 : 17;
         this.floatText(x, apexY, `+${payout}`, '#ffe9a8', size, 1400);
-        this.floatText(x, apexY + 20, `x${Math.round(multiplier * 10) / 10}`, '#fdba74', 12, 1400);
+        this.floatText(x, apexY + 20 * k, `x${Math.round(multiplier * 10) / 10}`, '#fdba74', 12, 1400);
         this.shake(payout >= 300 ? 340 : 220, Math.min(0.022, 0.006 + payout / 30000));
         if (payout >= 300) {
-          this.time.delayedCall(160, () => this.boom.emitParticleAt(x + 26, apexY - 18, 24));
-          this.time.delayedCall(320, () => this.boom.emitParticleAt(x - 30, apexY + 10, 24));
+          this.time.delayedCall(160, () => this.boom.emitParticleAt(x + 26 * k, apexY - 18 * k, 24));
+          this.time.delayedCall(320, () => this.boom.emitParticleAt(x - 30 * k, apexY + 10 * k, 24));
         }
       },
     });
@@ -914,13 +1014,14 @@ export class FuseScene extends Phaser.Scene {
   private celebrateThreshold(threshold: number) {
     const label = this.add
       .text(this.scale.width / 2, this.scale.height * 0.3, `x${threshold}!`, {
-        fontSize: '46px',
+        fontSize: `${46 * this.k}px`,
         color: threshold >= 50 ? '#f87171' : threshold >= 25 ? '#fb923c' : '#fbbf24',
         fontStyle: 'bold',
         stroke: '#0b0e1a',
-        strokeThickness: 6,
+        strokeThickness: 6 * this.k,
       })
       .setOrigin(0.5)
+      .setScrollFactor(0)
       .setDepth(30)
       .setScale(0.2)
       .setAlpha(0);
@@ -931,18 +1032,28 @@ export class FuseScene extends Phaser.Scene {
       duration: 240,
       ease: 'Back.Out',
       onComplete: () => {
-        this.tweens.add({ targets: label, alpha: 0, y: label.y - 26, delay: 420, duration: 380, onComplete: () => label.destroy() });
+        this.tweens.add({
+          targets: label,
+          alpha: 0,
+          y: label.y - 26 * this.k,
+          delay: 420,
+          duration: 380,
+          onComplete: () => label.destroy(),
+        });
       },
     });
     this.shake(190, 0.007);
   }
 
   private finaleVolley(totalScore: number) {
+    const k = this.k;
     const bursts = Phaser.Math.Clamp(1 + Math.floor(totalScore / 140), 1, 6);
     for (let i = 0; i < bursts; i++) {
       this.time.delayedCall(i * 170, () => {
-        const x = 60 + Math.random() * (this.scale.width - 120);
-        const y = 60 + Math.random() * 160;
+        // Burst inside the camera's current view, wherever it has scrolled.
+        const view = this.cameras.main.worldView;
+        const x = 60 * k + Math.random() * (this.scale.width - 120 * k);
+        const y = view.y + 60 * k + Math.random() * 160 * k;
         this.boom.emitParticleAt(x, y, 30);
         this.flashAt(x, y, 0xffe9a8, 26);
       });
@@ -959,15 +1070,15 @@ export class FuseScene extends Phaser.Scene {
   }
 
   private flashAt(x: number, y: number, color: number, radius: number) {
-    const flash = this.add.circle(x, y, radius, color, 0.5).setDepth(11);
+    const flash = this.add.circle(x, y, radius * this.k, color, 0.5).setDepth(11);
     this.tweens.add({ targets: flash, scale: 1.9, alpha: 0, duration: 340, onComplete: () => flash.destroy() });
   }
 
   private sparkleAt(x: number, y: number, color: number, count: number) {
     for (let i = 0; i < count; i++) {
       const angle = (Math.PI * 2 * i) / count + Math.random() * 0.5;
-      const distPx = 14 + Math.random() * 16;
-      const s = this.add.circle(x, y, 2, color).setDepth(12);
+      const distPx = (14 + Math.random() * 16) * this.k;
+      const s = this.add.circle(x, y, 2 * this.k, color).setDepth(12);
       this.tweens.add({
         targets: s,
         x: x + Math.cos(angle) * distPx,
@@ -981,11 +1092,25 @@ export class FuseScene extends Phaser.Scene {
   }
 
   private floatText(x: number, y: number, text: string, color: string, size: number, duration = 1100) {
+    const k = this.k;
     const label = this.add
-      .text(x, y, text, { fontSize: `${size}px`, color, fontStyle: 'bold', stroke: '#0b0e1a', strokeThickness: 4 })
+      .text(x, y, text, {
+        fontSize: `${size * k}px`,
+        color,
+        fontStyle: 'bold',
+        stroke: '#0b0e1a',
+        strokeThickness: 4 * k,
+      })
       .setOrigin(0.5)
       .setDepth(20);
-    this.tweens.add({ targets: label, y: y - 40, alpha: 0, duration, ease: 'Quad.Out', onComplete: () => label.destroy() });
+    this.tweens.add({
+      targets: label,
+      y: y - 40 * k,
+      alpha: 0,
+      duration,
+      ease: 'Quad.Out',
+      onComplete: () => label.destroy(),
+    });
   }
 
   private clearAll() {

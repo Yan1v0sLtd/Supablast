@@ -12,11 +12,15 @@ export function usePhaserGame(bridge: SceneBridge) {
 
   useEffect(() => {
     if (!containerRef.current || gameRef.current) return;
+    // Render the canvas buffer at device resolution: the game world uses
+    // logical 540-wide coordinates scaled by k = width/540 (see FuseScene.k),
+    // which is what keeps text and emoji sharp on 2x/3x mobile screens.
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
     const game = new Phaser.Game({
       type: Phaser.AUTO,
       parent: containerRef.current,
-      width: 540,
-      height: 880,
+      width: Math.round(540 * dpr),
+      height: Math.round(880 * dpr),
       backgroundColor: '#0b0e1a',
       scale: {
         mode: Phaser.Scale.FIT,
@@ -35,6 +39,10 @@ export function usePhaserGame(bridge: SceneBridge) {
         onRunFinished: () => bridgeRef.current.onRunFinished(),
       });
       sceneRef.current = scene;
+      if (import.meta.env.DEV) {
+        // Test-harness hook (dev server only, stripped from prod builds).
+        (window as unknown as Record<string, unknown>).__supablastScene = scene;
+      }
     });
     return () => {
       game.destroy(true);
