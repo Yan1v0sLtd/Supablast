@@ -44,4 +44,6 @@ Given identical `(seed, placements[])` the outcome is bit-identical everywhere. 
 
 ### Tuning
 
-Every gameplay number lives in `src/sim/tuning.ts`. Current values are v0 placeholders; the EV auditor (`npm run audit:boards`) prints per-socket P(reach) / E[mult|reach] / EV so tuning stays an evidence exercise. Known open items are tracked in GDD §12 — EV flatness across sockets is *not* yet achieved and is the first post-prototype tuning goal.
+Every gameplay number lives in `src/sim/tuning.ts`. Current values are v0 placeholders; the EV auditor (`npm run audit:boards`) prints per-socket P(reach) / E[mult|reach] / EV so tuning stays an evidence exercise.
+
+Current state of the pillar-1 gradient (sample boards): near ≈ 0.7–1.0 reach at low multipliers, mid ≈ 0.45, far ≈ 0.15–0.25 at x40–x75, EV near-flat (occasional ±20% flags — see GDD §12 for the open multiplier-curve question). Boards are serpentine rigs: rows chained side-to-side with zigzag risers, a looped bottom section so early fizzles kill a front rather than the run, and route-aware damp quotas that concentrate risk on the deeper half of each socket's path.

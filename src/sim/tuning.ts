@@ -12,8 +12,10 @@ export const TUNING = {
     cols: 7,
     rows: 12,
     jitter: 0.25,
-    neighborRadius: 1.45,
-    edgeKeepChance: 0.6,
+    neighborRadius: 1.45, // pocket clustering radius
+    chordChance: 0.15, // intra-row skip edge (loop + splitter site)
+    extraRiserChance: 0.25, // second, redundant route between rows
+    doubleRiserRows: 2, // bottom transitions always looped (no instant death)
     pocketCountMin: 1,
     pocketCountMax: 2,
     pocketMaxSize: 4,
@@ -28,10 +30,21 @@ export const TUNING = {
     midMax: 4,
     farMin: 2,
     farMax: 3,
+    nearMaxDist: 8, // hops; keeps near-socket multiplier in the x4-x8 band
+    farMinFraction: 0.65, // of the deepest reachable hop count
   },
   nodes: {
-    dampChance: 0.25, // fraction of plain junctions converted to damp
-    dampMinDistFromIgnition: 3, // keep the fragile zone away from ignition
+    // Damp rolls on each socket's fire path, by ring. P(reach) ≈ 0.65^quota
+    // before redundant-route bypasses: near ~0.8-1.0, mid ~0.4-0.65, far ~0.2-0.4.
+    dampQuotaNearMin: 0,
+    dampQuotaNearMax: 1,
+    dampQuotaMidMin: 1,
+    dampQuotaMidMax: 2,
+    dampQuotaFarMin: 2,
+    dampQuotaFarMax: 4,
+    dampFlavorChance: 0.05, // extra off-path damps (perceived risk)
+    dampPathDepthFraction: 0.45, // gates sit on the deeper 55% of each socket's path
+    dampMinDistFromIgnition: 6, // fragile zone starts past the bottom loop
 
     dampPassChance: 0.65, // GDD §3.1: 35% dies / 65% passes
     dampDelayTicks: 12, // 0.6s
@@ -51,7 +64,7 @@ export const TUNING = {
     sparkDelayTicksMax: 30, // 1.5s
   },
   edges: {
-    burnTicksMin: 8, // 0.4s
+    burnTicksMin: 6, // 0.3s
     burnTicksMax: 16, // 0.8s
   },
   multiplier: {

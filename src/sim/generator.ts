@@ -17,10 +17,23 @@ interface GenNode {
   decoyValue?: number;
   ring?: SocketRing;
   pocket: number; // -1 = main graph, >=0 = pocket index
+  row: number;
 }
 
 const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
   Math.hypot(a.x - b.x, a.y - b.y);
+
+const pair = (a: number, b: number): [number, number] => [Math.min(a, b), Math.max(a, b)];
+
+const dedupePairs = (pairs: Array<[number, number]>): Array<[number, number]> => {
+  const seen = new Set<string>();
+  return pairs.filter(([a, b]) => {
+    const key = `${a}-${b}`;
+    if (seen.has(key) || a === b) return false;
+    seen.add(key);
+    return true;
+  });
+};
 
 export function generateBoard(seed: string): Board {
   const rng = rngFromString(seed + ':board');
@@ -41,18 +54,53 @@ export function generateBoard(seed: string): Board {
     y: cell.cy + (rng() * 2 - 1) * B.jitter,
     kind: i === 0 ? 'ignition' : 'junction',
     pocket: -1,
+    row: cell.cy,
   }));
   const ignitionId = 0;
 
-  // 2. Edges: connect near neighbors, then stitch components together.
+  // 2. Edges: serpentine rig. Fire must wind side-to-side like a hand-strung
+  //    fuse line — the long effective path is what produces the 15-25s ride
+  //    (GDD §2) from 0.3-0.8s edges. Each row is chained left-to-right, rows
+  //    are joined by "risers" at alternating ends, and a few extra chords add
+  //    the redundancy that keeps one damp fizzle from ending every run.
   let edgePairs: Array<[number, number]> = [];
-  for (let i = 0; i < nodes.length; i++) {
-    for (let j = i + 1; j < nodes.length; j++) {
-      if (dist(nodes[i], nodes[j]) <= B.neighborRadius && rng() < B.edgeKeepChance) {
-        edgePairs.push([i, j]);
-      }
+  const rowNodes: GenNode[][] = [];
+  for (let r = 0; r < B.rows; r++) {
+    rowNodes.push(nodes.filter((n) => n.row === r).sort((a, b) => a.x - b.x));
+  }
+  for (const row of rowNodes) {
+    for (let i = 0; i + 1 < row.length; i++) {
+      edgePairs.push(pair(row[i].id, row[i + 1].id));
+      // Occasional intra-row chord: creates a loop + a degree-3 splitter site.
+      if (i + 2 < row.length && rng() < B.chordChance) edgePairs.push(pair(row[i].id, row[i + 2].id));
     }
   }
+  // Risers between adjacent occupied rows, zigzagging sides bottom-to-top.
+  // The first transitions always get BOTH risers: the bottom of the rig is a
+  // loop of parallel routes, so an early fizzle kills a front, not the show
+  // (GDD §1: the chain must die and resurge — never instantly end).
+  let side = rng() < 0.5 ? 0 : 1; // 0 = left end, 1 = right end
+  let transitionIndex = 0;
+  for (let r = B.rows - 1; r > 0; r--) {
+    const lower = rowNodes[r];
+    const upper = rowNodes[r - 1];
+    if (lower.length === 0 || upper.length === 0) continue;
+    const lowerEnd = side === 0 ? lower[0] : lower[lower.length - 1];
+    const upperEnd = side === 0 ? upper[0] : upper[upper.length - 1];
+    edgePairs.push(pair(lowerEnd.id, upperEnd.id));
+    // Second riser at the opposite end: a redundant route up.
+    const forceDouble = transitionIndex < B.doubleRiserRows;
+    if (forceDouble || rng() < B.extraRiserChance) {
+      const lowerOpp = side === 0 ? lower[lower.length - 1] : lower[0];
+      const upperOpp = side === 0 ? upper[upper.length - 1] : upper[0];
+      if (lowerOpp.id !== lowerEnd.id || upperOpp.id !== upperEnd.id) {
+        edgePairs.push(pair(lowerOpp.id, upperOpp.id));
+      }
+    }
+    side = 1 - side;
+    transitionIndex++;
+  }
+  edgePairs = dedupePairs(edgePairs);
   edgePairs = connectComponents(nodes, edgePairs);
 
   // 3. Carve 1-2 pockets in the top region, reachable only via spark gaps
@@ -110,11 +158,13 @@ export function generateBoard(seed: string): Board {
   }
 
   // 4. Distances from ignition (spark jumps count as hops) → socket strata.
-  const distances = bfsDistances(nodes, edgePairs, ignitionId);
+  const { distances, parents } = bfsDistances(nodes, edgePairs, ignitionId);
   const reachable = nodes.filter((n) => distances.get(n.id) !== undefined);
   const maxDist = Math.max(...reachable.map((n) => distances.get(n.id)!));
+  // Near is an absolute band (multiplier ≈ hops burned, so "near" must mean
+  // "few hops" to land the GDD's x4-x8 target), far is relative to the spine.
   const ringOf = (d: number): SocketRing =>
-    d <= maxDist / 3 ? 'near' : d <= (2 * maxDist) / 3 ? 'mid' : 'far';
+    d <= TUNING.sockets.nearMaxDist ? 'near' : d >= maxDist * TUNING.sockets.farMinFraction ? 'far' : 'mid';
 
   const S = TUNING.sockets;
   const eligible = (ring: SocketRing) =>
@@ -157,9 +207,43 @@ export function generateBoard(seed: string): Board {
     n.kind = 'decoy';
     n.decoyValue = randInt(rng, N.decoyValueMin, N.decoyValueMax);
   }
+  // Damp junctions with route-aware quotas: each socket's fire path gets a
+  // ring-dependent number of fizzle rolls, which is what engineers the GDD
+  // §3.5 risk gradient (near ≈ 85% reach, far ≈ 15-25%). Random or
+  // depth-banded damps leak through decoys/redundant risers.
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const quotaFor = (ring: SocketRing): number =>
+    ring === 'near'
+      ? randInt(rng, N.dampQuotaNearMin, N.dampQuotaNearMax)
+      : ring === 'mid'
+        ? randInt(rng, N.dampQuotaMidMin, N.dampQuotaMidMax)
+        : randInt(rng, N.dampQuotaFarMin, N.dampQuotaFarMax);
+  const socketsByDepth = nodes
+    .filter((n) => n.kind === 'socket')
+    .sort((a, b) => distances.get(a.id)! - distances.get(b.id)!);
+  for (const socket of socketsByDepth) {
+    const path: GenNode[] = [];
+    let cur: number | undefined = parents.get(socket.id);
+    while (cur !== undefined && cur !== ignitionId) {
+      path.push(nodeById.get(cur)!);
+      cur = parents.get(cur);
+    }
+    const existing = path.filter((n) => n.kind === 'damp').length;
+    // Risk lives on the deeper stretch of the path: early fizzles end runs
+    // cheaply, late fizzles are near-miss drama right in front of the prize.
+    const minDepth = Math.max(
+      N.dampMinDistFromIgnition,
+      Math.ceil(distances.get(socket.id)! * N.dampPathDepthFraction),
+    );
+    const candidates = shuffle(
+      rng,
+      path.filter((n) => n.kind === 'junction' && distances.get(n.id)! >= minDepth),
+    );
+    for (const n of candidates.slice(0, Math.max(0, quotaFor(socket.ring!) - existing))) n.kind = 'damp';
+  }
+  // A pinch of off-path damps: perceived risk on routes nobody bet on.
   for (const n of plainJunctions()) {
-    const d = distances.get(n.id)!;
-    if (d >= N.dampMinDistFromIgnition && rng() < N.dampChance) n.kind = 'damp';
+    if (distances.get(n.id)! >= N.dampMinDistFromIgnition && rng() < N.dampFlavorChance) n.kind = 'damp';
   }
 
   // 6. Materialize.
@@ -272,12 +356,12 @@ function reconnectMain(
   }
 }
 
-/** BFS hop distance from ignition; spark gap → target counts as one directed hop. */
+/** BFS from ignition; spark gap → target counts as one directed hop. */
 function bfsDistances(
   nodes: GenNode[],
   edgePairs: Array<[number, number]>,
   ignitionId: number,
-): Map<number, number> {
+): { distances: Map<number, number>; parents: Map<number, number> } {
   const adj = new Map<number, number[]>(nodes.map((n) => [n.id, []]));
   for (const [a, b] of edgePairs) {
     adj.get(a)!.push(b);
@@ -286,16 +370,18 @@ function bfsDistances(
   for (const n of nodes)
     if (n.kind === 'sparkGap' && n.sparkTargetId !== undefined) adj.get(n.id)!.push(n.sparkTargetId);
 
-  const distMap = new Map<number, number>([[ignitionId, 0]]);
+  const distances = new Map<number, number>([[ignitionId, 0]]);
+  const parents = new Map<number, number>();
   const queue = [ignitionId];
   while (queue.length) {
     const cur = queue.shift()!;
     for (const nb of adj.get(cur)!.sort((a, b) => a - b)) {
-      if (!distMap.has(nb)) {
-        distMap.set(nb, distMap.get(cur)! + 1);
+      if (!distances.has(nb)) {
+        distances.set(nb, distances.get(cur)! + 1);
+        parents.set(nb, cur);
         queue.push(nb);
       }
     }
   }
-  return distMap;
+  return { distances, parents };
 }
